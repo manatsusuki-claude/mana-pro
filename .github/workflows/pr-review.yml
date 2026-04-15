@@ -1,0 +1,182 @@
+name: Autonomous PR Review by Claude
+
+# mainブランチへのPRが作成・更新されたときに自動実行
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  claude-review:
+    name: Claude Code Autonomous Review
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      # MCP サーバー設定（GitHub + Linear）を ~/.claude/settings.json に書き込む
+      # Python を使うことで特殊文字を安全に処理する
+      - name: Configure Claude MCP servers
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          mkdir -p ~/.claude
+          python3 << 'PYEOF'
+          import json, os, pathlib
+
+          settings = {
+            "mcpServers": {
+              "github": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {
+                  "GITHUB_PERSONAL_ACCESS_TOKEN": os.environ["GITHUB_TOKEN"]
+                }
+              }
+            }
+          }
+
+          linear_key = os.environ.get("LINEAR_API_KEY", "")
+          if linear_key:
+            settings["mcpServers"]["linear"] = {
+              "command": "npx",
+              "args": ["-y", "linear-mcp-server"],
+              "env": {
+                "LINEAR_API_KEY": linear_key
+              }
+            }
+
+          settings_path = pathlib.Path.home() / ".claude" / "settings.json"
+          settings_path.write_text(json.dumps(settings, indent=2))
+          print("MCP configuration written successfully.")
+          PYEOF
+
+      # PR ボディを安全にファイルへ書き出す（シェルのクォート問題を回避）
+      - name: Write PR body to file
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s' "$PR_BODY" > /tmp/pr_body.txt
+
+      # Claude Code CLI でレビューを実行
+      - name: Run autonomous PR review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          PR_BODY_CONTENT=$(cat /tmp/pr_body.txt)
+
+          claude --dangerously-skip-permissions -p "
+          You are an expert autonomous code reviewer. A pull request has just been opened
+          against the main branch. Execute ALL tasks below, in order, without stopping.
+
+          ===== CONTEXT =====
+          Repository : ${REPO_OWNER}/${REPO_NAME}
+          PR Number  : #${PR_NUMBER}
+          PR Title   : ${PR_TITLE}
+          PR Author  : @${PR_AUTHOR}
+          PR Body    :
+          ${PR_BODY_CONTENT}
+          ===================
+
+          ===== TASK 1: Retrieve PR details =====
+          Use GitHub MCP tools to:
+          - Get the full diff of PR #${PR_NUMBER} in ${REPO_OWNER}/${REPO_NAME}
+          - Get the complete list of changed files with their status (added/modified/deleted)
+          Keep the results in memory for the review step.
+
+          ===== TASK 2: Check for related Linear issues =====
+          Scan the PR title AND body for Linear issue references:
+          - Short codes  : LIN-123, MANA-456, ENG-789, etc.
+          - URLs         : https://linear.app/*/issue/*
+          If references are found AND Linear MCP is available, retrieve those issue details
+          (title, description, current status, assignee).
+          If no references are found, note that and continue.
+
+          ===== TASK 3: Security-focused code review =====
+          Analyze ALL changes. Apply the following priorities:
+
+          [CRITICAL — /payments/ and /auth/ paths]
+          Any file whose path contains '/payments/' or '/auth/':
+          - Payments : secure charge/refund flows, no PII/card data in logs, idempotency
+            keys, proper error handling, PCI-DSS alignment, no raw card numbers stored.
+          - Auth      : no authentication bypass, secure token generation/storage/expiry,
+            proper session invalidation, no privilege escalation paths,
+            protection against brute-force / replay attacks.
+
+          [ALL FILES]
+          - Missing test files: new source files without a corresponding test file
+          - Logic errors     : off-by-one, incorrect conditionals, improper null/undefined handling
+          - Security risks   : SQL/NoSQL injection, XSS, CSRF, IDOR, hardcoded secrets or
+            credentials, insecure deserialization, path traversal
+          - Race conditions and concurrency issues
+          - Dead code or unreachable branches introduced
+
+          Classify every finding as: CRITICAL / HIGH / MEDIUM / LOW
+
+          ===== TASK 4: Post review comment on the PR =====
+          Post a single, well-structured review comment on PR #${PR_NUMBER} in
+          ${REPO_OWNER}/${REPO_NAME} using the following template (adapt content to findings):
+
+          ---
+          @${PR_AUTHOR} Thank you for this PR! Here is my autonomous review.
+
+          ## Summary
+          <2-3 sentence overview of the change and overall quality>
+
+          ## Critical Issues
+          <List or 'None found.'>
+          - **[FILE:LINE]** Description. **Suggested fix:** ...
+
+          ## High Issues
+          <List or 'None found.'>
+
+          ## Medium Issues
+          <List or 'None found.'>
+
+          ## Low Issues / Suggestions
+          <List or 'None found.'>
+
+          ## Missing Tests
+          <List files that need tests, or 'All new code appears to have test coverage.'>
+
+          ## Positive Notes
+          <Acknowledge good patterns or practices in the PR>
+
+          ---
+          *Reviewed autonomously by Claude Code*
+          ---
+
+          ===== TASK 5: Update Linear issue status (if applicable) =====
+          If a Linear issue was identified in TASK 2, update its status to **'In Review'**
+          using the Linear MCP tools.
+          If no Linear issue was found, skip this task.
+
+          Begin executing TASK 1 now.
+          "
