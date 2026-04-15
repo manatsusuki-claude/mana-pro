@@ -79,3 +79,49 @@ jobs:
             cat review.md
           } > comment.md
           gh pr comment "$PR_NUMBER" --body-file comment.md
+
+      - name: Update Linear issue to In Review
+        if: ${{ github.event.action == 'opened' || github.event.action == 'reopened' }}
+        continue-on-error: true
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if [ -z "$LINEAR_API_KEY" ]; then
+            echo "LINEAR_API_KEY not set — skipping"
+            exit 0
+          fi
+
+          # Extract first Linear-style issue ID (e.g. ABC-123) from title, branch, or body
+          SEARCH_TEXT="$PR_TITLE $PR_BRANCH $PR_BODY"
+          ISSUE_ID=$(echo "$SEARCH_TEXT" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -n1 || true)
+
+          if [ -z "$ISSUE_ID" ]; then
+            echo "No Linear issue ID found in PR — skipping"
+            exit 0
+          fi
+          echo "Found Linear issue: $ISSUE_ID"
+
+          # 1. Look up issue to get its team's workflow states
+          ISSUE_RESP=$(curl -sS https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg id "$ISSUE_ID" '{query:"query($id:String!){issue(id:$id){id team{id states(filter:{name:{eqIgnoreCase:\"In Review\"}}){nodes{id name}}}}}", variables:{id:$id}}')")
+
+          INTERNAL_ID=$(echo "$ISSUE_RESP" | jq -r '.data.issue.id // empty')
+          STATE_ID=$(echo "$ISSUE_RESP" | jq -r '.data.issue.team.states.nodes[0].id // empty')
+
+          if [ -z "$INTERNAL_ID" ] || [ -z "$STATE_ID" ]; then
+            echo "Could not resolve issue or 'In Review' state:"
+            echo "$ISSUE_RESP"
+            exit 0
+          fi
+
+          # 2. Update issue state
+          UPDATE_RESP=$(curl -sS https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg id "$INTERNAL_ID" --arg state "$STATE_ID" '{query:"mutation($id:String!,$state:String!){issueUpdate(id:$id,input:{stateId:$state}){success}}", variables:{id:$id,state:$state}}')")
+          echo "Linear update response: $UPDATE_RESP"
