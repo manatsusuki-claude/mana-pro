@@ -3,11 +3,16 @@ name: PR Review (Claude)
 on:
   pull_request:
     types: [opened, reopened, synchronize]
+    branches: [main]
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   review:
@@ -19,18 +24,16 @@ jobs:
           fetch-depth: 0
 
       - name: Get PR diff
-        id: diff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           gh pr diff "$PR_NUMBER" > pr.diff
-          # Cap diff at ~60KB to stay within prompt limits
-          head -c 60000 pr.diff > pr_capped.diff
-          echo "size=$(wc -c < pr_capped.diff)" >> "$GITHUB_OUTPUT"
+          # Strip non-UTF8 bytes (binary blobs) and cap at ~60KB
+          iconv -f utf-8 -t utf-8 -c pr.diff | head -c 60000 > pr_capped.diff
+          wc -c pr_capped.diff
 
       - name: Call Claude for review
-        id: claude
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -40,7 +43,7 @@ jobs:
             --arg title "$PR_TITLE" \
             --arg diff "$DIFF_CONTENT" \
             '{
-              model: "claude-opus-4-6",
+              model: "claude-sonnet-4-5",
               max_tokens: 2048,
               messages: [{
                 role: "user",
@@ -48,13 +51,20 @@ jobs:
               }]
             }' > payload.json
 
-          curl -sS https://api.anthropic.com/v1/messages \
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" https://api.anthropic.com/v1/messages \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
-            -d @payload.json > response.json
+            -d @payload.json)
 
-          jq -r '.content[0].text // (.error | tostring)' response.json > review.md
+          echo "HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Anthropic API error:"
+            cat response.json
+            exit 1
+          fi
+
+          jq -e -r '.content[0].text' response.json > review.md
           echo "--- review ---"
           cat review.md
 
