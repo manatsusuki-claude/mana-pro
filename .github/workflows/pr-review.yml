@@ -1,0 +1,127 @@
+name: PR Review (Claude)
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr diff "$PR_NUMBER" > pr.diff
+          # Strip non-UTF8 bytes (binary blobs) and cap at ~60KB
+          iconv -f utf-8 -t utf-8 -c pr.diff | head -c 60000 > pr_capped.diff
+          wc -c pr_capped.diff
+
+      - name: Call Claude for review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          DIFF_CONTENT=$(cat pr_capped.diff)
+          jq -n \
+            --arg title "$PR_TITLE" \
+            --arg diff "$DIFF_CONTENT" \
+            '{
+              model: "claude-sonnet-4-5",
+              max_tokens: 2048,
+              messages: [{
+                role: "user",
+                content: ("You are a concise code reviewer. Review the PR below and produce a short Markdown report with sections: **Summary**, **Issues** (bulleted, only real problems — bugs, security, correctness), **Suggestions** (optional). If nothing is wrong, say so briefly.\n\nPR title: " + $title + "\n\nDiff:\n```diff\n" + $diff + "\n```")
+              }]
+            }' > payload.json
+
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d @payload.json)
+
+          echo "HTTP $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Anthropic API error:"
+            cat response.json
+            exit 1
+          fi
+
+          jq -e -r '.content[0].text' response.json > review.md
+          echo "--- review ---"
+          cat review.md
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "## 🤖 Claude Review"
+            echo
+            cat review.md
+          } > comment.md
+          gh pr comment "$PR_NUMBER" --body-file comment.md
+
+      - name: Update Linear issue to In Review
+        if: ${{ github.event.action == 'opened' || github.event.action == 'reopened' }}
+        continue-on-error: true
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if [ -z "$LINEAR_API_KEY" ]; then
+            echo "LINEAR_API_KEY not set — skipping"
+            exit 0
+          fi
+
+          # Extract first Linear-style issue ID (e.g. ABC-123) from title, branch, or body
+          SEARCH_TEXT="$PR_TITLE $PR_BRANCH $PR_BODY"
+          ISSUE_ID=$(echo "$SEARCH_TEXT" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -n1 || true)
+
+          if [ -z "$ISSUE_ID" ]; then
+            echo "No Linear issue ID found in PR — skipping"
+            exit 0
+          fi
+          echo "Found Linear issue: $ISSUE_ID"
+
+          # 1. Look up issue to get its team's workflow states
+          ISSUE_RESP=$(curl -sS https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg id "$ISSUE_ID" '{query:"query($id:String!){issue(id:$id){id team{id states(filter:{name:{eqIgnoreCase:\"In Review\"}}){nodes{id name}}}}}", variables:{id:$id}}')")
+
+          INTERNAL_ID=$(echo "$ISSUE_RESP" | jq -r '.data.issue.id // empty')
+          STATE_ID=$(echo "$ISSUE_RESP" | jq -r '.data.issue.team.states.nodes[0].id // empty')
+
+          if [ -z "$INTERNAL_ID" ] || [ -z "$STATE_ID" ]; then
+            echo "Could not resolve issue or 'In Review' state:"
+            echo "$ISSUE_RESP"
+            exit 0
+          fi
+
+          # 2. Update issue state
+          UPDATE_RESP=$(curl -sS https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg id "$INTERNAL_ID" --arg state "$STATE_ID" '{query:"mutation($id:String!,$state:String!){issueUpdate(id:$id,input:{stateId:$state}){success}}", variables:{id:$id,state:$state}}')")
+          echo "Linear update response: $UPDATE_RESP"
